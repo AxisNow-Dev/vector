@@ -24,8 +24,8 @@ use tokio_openssl::SslStream;
 use tonic::transport::{Certificate, server::Connected};
 
 use super::{
-    CreateAcceptorSnafu, HandshakeSnafu, IncomingListenerSnafu, MaybeTlsSettings, MaybeTlsStream,
-    SslBuildSnafu, TcpBindSnafu, TlsAcceptorReloader, TlsError, TlsSettings,
+    CreateAcceptorSnafu, IncomingListenerSnafu, MaybeTlsSettings, MaybeTlsStream, SslBuildSnafu,
+    TcpBindSnafu, TlsAcceptorReloader, TlsError, TlsSettings, reload::TlsAcceptor,
 };
 use crate::tcp::{self, TcpKeepaliveConfig};
 
@@ -72,7 +72,9 @@ impl MaybeTlsSettings {
         let acceptor = match (self, reloader) {
             (Self::Raw(()), _) => None,
             (Self::Tls(_), Some(reloader)) => Some(reloader.shared()),
-            (Self::Tls(tls), None) => Some(Arc::new(ArcSwap::from_pointee(tls.acceptor()?))),
+            (Self::Tls(tls), None) => Some(Arc::new(ArcSwap::from_pointee(TlsAcceptor::build(
+                tls, None,
+            )?))),
         };
 
         Ok(MaybeTlsListener {
@@ -86,7 +88,7 @@ impl MaybeTlsSettings {
 
 pub struct MaybeTlsListener {
     listener: TcpListener,
-    acceptor: Option<Arc<ArcSwap<SslAcceptor>>>,
+    acceptor: Option<Arc<ArcSwap<TlsAcceptor>>>,
     origin_filter: Option<Vec<IpNet>>,
     keepalive: Option<TcpKeepaliveConfig>,
 }
@@ -114,7 +116,7 @@ impl MaybeTlsListener {
             peer_addr,
             self.acceptor
                 .as_ref()
-                .map(|accptr| accptr.load().as_ref().clone()),
+                .map(|acceptor| acceptor.load().acceptor.clone()),
         );
 
         if let Some(origin_filter) = &self.origin_filter {
@@ -275,6 +277,21 @@ impl<S> MaybeTlsIncomingStream<S> {
     }
 }
 
+/// Whether the handshake failed because the peer certificate failed verification.
+fn is_certificate_verify_failure(error: &openssl::ssl::Error) -> bool {
+    // From OpenSSL's `err.h` and `sslerr.h`; `openssl-sys` does not export them.
+    const ERR_LIB_SSL: std::ffi::c_int = 20;
+    const SSL_R_CERTIFICATE_VERIFY_FAILED: std::ffi::c_int = 134;
+
+    error.code() == openssl::ssl::ErrorCode::SSL
+        && error.ssl_error().is_some_and(|stack| {
+            stack.errors().iter().any(|error| {
+                error.library_code() == ERR_LIB_SSL
+                    && error.reason_code() == SSL_R_CERTIFICATE_VERIFY_FAILED
+            })
+        })
+}
+
 impl MaybeTlsIncomingStream<TcpStream> {
     pub(super) fn new(
         stream: TcpStream,
@@ -286,10 +303,16 @@ impl MaybeTlsIncomingStream<TcpStream> {
                 async move {
                     let ssl = Ssl::new(acceptor.context()).context(SslBuildSnafu)?;
                     let mut stream = SslStream::new(ssl, stream).context(SslBuildSnafu)?;
-                    Pin::new(&mut stream)
-                        .accept()
-                        .await
-                        .context(HandshakeSnafu)?;
+                    if let Err(source) = Pin::new(&mut stream).accept().await {
+                        // The error itself only says verification failed; the verify result says why.
+                        let error = if is_certificate_verify_failure(&source) {
+                            let reason = stream.ssl().verify_result();
+                            TlsError::PeerCertificateRejected { source, reason }
+                        } else {
+                            TlsError::Handshake { source }
+                        };
+                        return Err(error);
+                    }
                     Ok(stream)
                 }
                 .boxed(),
